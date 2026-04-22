@@ -168,9 +168,14 @@
 <script>
 import _ from 'lodash'
 import { get, sync } from 'vuex-pathify'
+import Cookies from 'js-cookie'
 import markdownHelp from './markdown/help.vue'
 import gql from 'graphql-tag'
 import DOMPurify from 'dompurify'
+import { v4 as uuid } from 'uuid'
+
+import listFolderAssetQuery from 'gql/editor/editor-media-query-folder-list.gql'
+import createAssetFolderMutation from 'gql/editor/editor-media-mutation-folder-create.gql'
 
 /* global siteConfig, siteLangs */
 
@@ -432,22 +437,154 @@ export default {
     onCmInput: _.debounce(function (newContent) {
       this.processContent(newContent)
     }, 600),
-    onCmPaste (cm, ev) {
-      // const clipItems = (ev.clipboardData || ev.originalEvent.clipboardData).items
-      // for (let clipItem of clipItems) {
-      //   if (_.startsWith(clipItem.type, 'image/')) {
-      //     const file = clipItem.getAsFile()
-      //     const reader = new FileReader()
-      //     reader.onload = evt => {
-      //       this.$store.commit(`loadingStart`, 'editor-paste-image')
-      //       this.insertAfter({
-      //         content: `![${file.name}](${evt.target.result})`,
-      //         newLine: true
-      //       })
-      //     }
-      //     reader.readAsDataURL(file)
-      //   }
-      // }
+    getClipboardImageFile (event) {
+      const clipboardData = event.clipboardData || (event.originalEvent && event.originalEvent.clipboardData)
+      const files = clipboardData ? clipboardData.files : []
+      const items = clipboardData ? clipboardData.items : []
+
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i]
+        if (file && _.startsWith(file.type, 'image/')) {
+          return file
+        }
+      }
+
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i]
+        if (item.kind === 'file' && _.startsWith(item.type, 'image/')) {
+          return item.getAsFile()
+        }
+      }
+
+      return null
+    },
+    getClipboardImageExtension (file) {
+      if (file && file.name && file.name.lastIndexOf('.') >= 0) {
+        return file.name.substring(file.name.lastIndexOf('.')).toLowerCase()
+      }
+
+      switch (file.type) {
+        case 'image/gif':
+          return '.gif'
+        case 'image/jpeg':
+          return '.jpg'
+        case 'image/svg+xml':
+          return '.svg'
+        case 'image/webp':
+          return '.webp'
+        default:
+          return '.png'
+      }
+    },
+    async getAssetFolders (parentFolderId) {
+      const resp = await this.$apollo.query({
+        query: listFolderAssetQuery,
+        variables: {
+          parentFolderId
+        },
+        fetchPolicy: 'network-only'
+      })
+
+      return _.get(resp, 'data.assets.folders', [])
+    },
+    async getOrCreateAssetFolder (parentFolderId, segment) {
+      const normalizedSegment = segment.trim().toLowerCase()
+      let folders = await this.getAssetFolders(parentFolderId)
+      let folder = _.find(folders, ['slug', normalizedSegment])
+
+      if (folder) {
+        return folder
+      }
+
+      const resp = await this.$apollo.mutate({
+        mutation: createAssetFolderMutation,
+        variables: {
+          parentFolderId,
+          slug: normalizedSegment
+        }
+      })
+
+      if (!_.get(resp, 'data.assets.createFolder.responseResult.succeeded', false)) {
+        throw new Error(_.get(resp, 'data.assets.createFolder.responseResult.message', 'Failed to create asset folder.'))
+      }
+
+      folders = await this.getAssetFolders(parentFolderId)
+      folder = _.find(folders, ['slug', normalizedSegment])
+      if (!folder) {
+        throw new Error('Asset folder was created but could not be loaded.')
+      }
+
+      return folder
+    },
+    async ensurePasteTargetFolder () {
+      const segments = _.filter(String(this.path || '').split('/').map(segment => segment.trim()), Boolean)
+      let folderId = 0
+      const folderPath = []
+
+      for (const segment of segments) {
+        const folder = await this.getOrCreateAssetFolder(folderId, segment)
+        folderId = folder.id
+        folderPath.push(folder.slug)
+      }
+
+      return {
+        folderId,
+        folderPath: folderPath.join('/')
+      }
+    },
+    async uploadClipboardImage (file, folderId, filename) {
+      const formData = new FormData()
+      const jwtToken = Cookies.get('jwt')
+
+      formData.append('mediaUpload', JSON.stringify({ folderId }))
+      formData.append('mediaUpload', file, filename)
+
+      const resp = await fetch('/u', {
+        method: 'POST',
+        headers: jwtToken ? {
+          Authorization: `Bearer ${jwtToken}`
+        } : {},
+        body: formData
+      })
+
+      if (!resp.ok) {
+        let message = 'Failed to upload pasted image.'
+
+        try {
+          const body = await resp.json()
+          message = body.message || message
+        } catch (err) {
+          const text = await resp.text()
+          if (text) {
+            message = text
+          }
+        }
+
+        throw new Error(message)
+      }
+    },
+    async onCmPaste (cm, ev) {
+      const file = this.getClipboardImageFile(ev)
+      if (!file) {
+        return
+      }
+
+      ev.preventDefault()
+      const cursor = cm.doc.getCursor('head')
+      this.$store.commit('loadingStart', 'editor-paste-image')
+
+      try {
+        const targetFolder = await this.ensurePasteTargetFolder()
+        const filename = `${uuid()}${this.getClipboardImageExtension(file)}`
+        await this.uploadClipboardImage(file, targetFolder.folderId, filename)
+
+        const assetPath = targetFolder.folderPath ? `/${targetFolder.folderPath}/${filename}` : `/${filename}`
+        cm.doc.replaceRange(`![${filename}](${assetPath})`, cursor)
+      } catch (err) {
+        this.$store.commit('pushGraphError', err)
+      } finally {
+        this.$store.commit('loadingStop', 'editor-paste-image')
+      }
     },
     processContent (newContent) {
       linesMap = []
