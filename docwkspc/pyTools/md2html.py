@@ -117,20 +117,38 @@ def resolve_output_path(input_path: Path, output_arg: str | None) -> Path:
 def resolve_asset_dir(output_path: Path, asset_dir_arg: str | None) -> Path:
     if asset_dir_arg:
         asset_dir = Path(asset_dir_arg)
+        if not asset_dir.is_absolute():
+            asset_dir = output_path.parent / asset_dir
     else:
         asset_dir = output_path.parent / f'{output_path.stem}_assets'
     return asset_dir.resolve()
 
 
-def resolve_asset_path_prefix(output_path: Path, asset_dir: Path, asset_path_arg: str | None) -> str:
+def normalize_asset_path(value: str) -> str:
+    asset_path = value.replace('\\', '/').strip()
+    if asset_path in {'', '.', './'}:
+        return ''
+    return asset_path.rstrip('/')
+
+
+def resolve_asset_path_prefix(
+    output_path: Path,
+    asset_dir: Path,
+    asset_path_arg: str | None,
+    asset_dir_arg: str | None = None,
+) -> str:
     if asset_path_arg:
-        asset_path = asset_path_arg.replace('\\', '/').strip()
-        if asset_path in {'', '.', './'}:
-            return ''
-        return asset_path.rstrip('/')
+        return normalize_asset_path(asset_path_arg)
+
+    if asset_dir_arg:
+        raw_asset_dir = Path(asset_dir_arg)
+        if not raw_asset_dir.is_absolute():
+            return normalize_asset_path(asset_dir_arg)
 
     relative_path = Path(os.path.relpath(asset_dir, output_path.parent)).as_posix()
-    return '' if relative_path == '.' else relative_path
+    if relative_path == '.':
+        return ''
+    return relative_path if relative_path.startswith('.') else f'./{relative_path}'
 
 
 def unwrap_markdown_url(url: str) -> str:
@@ -410,7 +428,7 @@ def convert_markdown_document(
 
     output_path = resolve_output_path(resolved_input_path, output_arg)
     asset_dir = resolve_asset_dir(output_path, asset_dir_arg)
-    asset_path_prefix = resolve_asset_path_prefix(output_path, asset_dir, asset_path_arg)
+    asset_path_prefix = resolve_asset_path_prefix(output_path, asset_dir, asset_path_arg, asset_dir_arg)
 
     markdown_text = resolved_input_path.read_text(encoding='utf-8')
     title = title_arg.strip() if title_arg and title_arg.strip() else extract_title(markdown_text, resolved_input_path.stem)
@@ -459,6 +477,10 @@ class MarkdownExporterApp:
         self.asset_dir_var = tk.StringVar(value=(getattr(initial_args, 'asset_dir', '') or ''))
         self.asset_path_var = tk.StringVar(value=(getattr(initial_args, 'asset_path', '') or ''))
         self.title_var = tk.StringVar(value=(getattr(initial_args, 'title', '') or ''))
+        self._asset_path_syncing = False
+        self._last_auto_asset_path = ''
+        self._asset_path_is_auto = not self.asset_path_var.get().strip()
+        self.asset_path_var.trace_add('write', self._on_asset_path_var_changed)
         self.status_var = tk.StringVar(value='Select a Markdown file to start.')
 
         self._configure_style()
@@ -540,6 +562,24 @@ class MarkdownExporterApp:
         ttk.Entry(parent, textvariable=variable).grid(row=row, column=1, columnspan=2, sticky='ew', pady=6)
 
 
+    def _on_asset_path_var_changed(self, *_args) -> None:
+        if self._asset_path_syncing:
+            return
+
+        current_value = self.asset_path_var.get().strip()
+        self._asset_path_is_auto = current_value in {'', self._last_auto_asset_path}
+
+
+    def _set_auto_asset_path(self, value: str) -> None:
+        self._asset_path_syncing = True
+        try:
+            self.asset_path_var.set(value)
+        finally:
+            self._asset_path_syncing = False
+        self._last_auto_asset_path = value
+        self._asset_path_is_auto = True
+
+
     def _browse_input_file(self) -> None:
         selected = filedialog.askopenfilename(
             title='Select Markdown File',
@@ -594,9 +634,12 @@ class MarkdownExporterApp:
             self.asset_dir_var.set(str(asset_dir))
 
         asset_path_value = self.asset_path_var.get().strip()
-        asset_path = resolve_asset_path_prefix(output_path, asset_dir, asset_path_value or None)
-        if force or not asset_path_value:
-            self.asset_path_var.set(asset_path)
+        asset_path_arg = asset_path_value or None
+        if force or not asset_path_value or self._asset_path_is_auto:
+            asset_path_arg = None
+        asset_path = resolve_asset_path_prefix(output_path, asset_dir, asset_path_arg, asset_dir_value or None)
+        if force or not asset_path_value or self._asset_path_is_auto:
+            self._set_auto_asset_path(asset_path)
 
 
     def _start_conversion(self) -> None:
@@ -608,6 +651,7 @@ class MarkdownExporterApp:
             messagebox.showerror('Missing Input', 'Please select a Markdown file first.')
             return
 
+        self._apply_default_paths(force=False)
         self._set_busy(True)
         self.status_var.set('Converting...')
         self._append_log('Starting conversion...')

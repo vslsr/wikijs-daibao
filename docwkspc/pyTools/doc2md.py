@@ -28,6 +28,22 @@ else:
 	MARKITDOWN_IMPORT_ERROR = None
 
 try:
+	import mammoth
+except ImportError as exc:
+	mammoth = None
+	MAMMOTH_IMPORT_ERROR = exc
+else:
+	MAMMOTH_IMPORT_ERROR = None
+
+try:
+	from markdownify import markdownify as markdownify_html
+except ImportError as exc:
+	markdownify_html = None
+	MARKDOWNIFY_IMPORT_ERROR = exc
+else:
+	MARKDOWNIFY_IMPORT_ERROR = None
+
+try:
 	import tkinter as tk
 	from tkinter import filedialog, messagebox, ttk
 	from tkinter.scrolledtext import ScrolledText
@@ -116,12 +132,73 @@ def parse_args() -> argparse.Namespace:
 	return parser.parse_args()
 
 
-def require_markitdown() -> None:
-	if MarkItDown is None:
-		raise RuntimeError(
-			'markitdown is not installed in this Python environment. '
-			'Install it with the docx extra, for example: pip install "markitdown[docx]"'
-		) from MARKITDOWN_IMPORT_ERROR
+def can_use_markitdown() -> bool:
+	return MarkItDown is not None
+
+
+def can_use_mammoth_fallback() -> bool:
+	return mammoth is not None and markdownify_html is not None
+
+
+def require_word_converter() -> None:
+	if can_use_markitdown() or can_use_mammoth_fallback():
+		return
+
+	details: list[str] = []
+	if MARKITDOWN_IMPORT_ERROR is not None:
+		details.append(f'markitdown import failed: {MARKITDOWN_IMPORT_ERROR}')
+	if MAMMOTH_IMPORT_ERROR is not None:
+		details.append(f'mammoth import failed: {MAMMOTH_IMPORT_ERROR}')
+	if MARKDOWNIFY_IMPORT_ERROR is not None:
+		details.append(f'markdownify import failed: {MARKDOWNIFY_IMPORT_ERROR}')
+
+	message = (
+		'No available Word conversion backend. '
+		'Install markitdown with the docx extra, or install both mammoth and markdownify.'
+	)
+	if details:
+		message = f'{message} Details: {'; '.join(details)}'
+
+	raise RuntimeError(message) from MARKITDOWN_IMPORT_ERROR
+
+
+def convert_docx_with_markitdown(input_path: Path) -> tuple[str, list[str]]:
+	converter = MarkItDown(enable_plugins=False)
+	result = converter.convert(input_path, keep_data_uris=True)
+	return finalize_markdown(result.text_content or ''), []
+
+
+def convert_docx_with_mammoth(input_path: Path) -> tuple[str, list[str]]:
+	with input_path.open('rb') as stream:
+		result = mammoth.convert_to_html(stream, convert_image=mammoth.images.data_uri)
+
+	warnings = [
+		(
+			f'Mammoth {getattr(item, "type", "warning")}: '
+			f'{getattr(item, "message", str(item))}'
+		)
+		for item in result.messages
+	]
+	markdown_text = markdownify_html(result.value, heading_style='ATX')
+	return finalize_markdown(markdown_text), warnings
+
+
+def convert_docx_to_markdown(input_path: Path) -> tuple[str, list[str]]:
+	if can_use_markitdown():
+		return convert_docx_with_markitdown(input_path)
+
+	if can_use_mammoth_fallback():
+		markdown_text, warnings = convert_docx_with_mammoth(input_path)
+		if MARKITDOWN_IMPORT_ERROR is not None:
+			warnings.insert(
+				0,
+				'Used mammoth/markdownify fallback because markitdown could not be imported: '
+				f'{MARKITDOWN_IMPORT_ERROR}',
+			)
+		return markdown_text, warnings
+
+	require_word_converter()
+	raise AssertionError('Word conversion backend should have been available after validation.')
 
 
 def resolve_output_path(input_path: Path, output_arg: str | None) -> Path:
@@ -139,20 +216,38 @@ def resolve_output_path(input_path: Path, output_arg: str | None) -> Path:
 def resolve_asset_dir(output_path: Path, asset_dir_arg: str | None) -> Path:
 	if asset_dir_arg:
 		asset_dir = Path(asset_dir_arg)
+		if not asset_dir.is_absolute():
+			asset_dir = output_path.parent / asset_dir
 	else:
 		asset_dir = output_path.parent / f'{output_path.stem}_assets'
 	return asset_dir.resolve()
 
 
-def resolve_asset_path_prefix(output_path: Path, asset_dir: Path, asset_path_arg: str | None) -> str:
+def normalize_asset_path(value: str) -> str:
+	asset_path = value.replace('\\', '/').strip()
+	if asset_path in {'', '.', './'}:
+		return ''
+	return asset_path.rstrip('/')
+
+
+def resolve_asset_path_prefix(
+	output_path: Path,
+	asset_dir: Path,
+	asset_path_arg: str | None,
+	asset_dir_arg: str | None = None,
+) -> str:
 	if asset_path_arg:
-		asset_path = asset_path_arg.replace('\\', '/').strip()
-		if asset_path in {'', '.', './'}:
-			return ''
-		return asset_path.rstrip('/')
+		return normalize_asset_path(asset_path_arg)
+
+	if asset_dir_arg:
+		raw_asset_dir = Path(asset_dir_arg)
+		if not raw_asset_dir.is_absolute():
+			return normalize_asset_path(asset_dir_arg)
 
 	relative_path = Path(os.path.relpath(asset_dir, output_path.parent)).as_posix()
-	return '' if relative_path == '.' else relative_path
+	if relative_path == '.':
+		return ''
+	return relative_path if relative_path.startswith('.') else f'./{relative_path}'
 
 
 def unwrap_markdown_url(url: str) -> str:
@@ -406,7 +501,7 @@ def convert_word_document(
 	asset_dir_arg: str | None = None,
 	asset_path_arg: str | None = None,
 ) -> ConversionResult:
-	require_markitdown()
+	require_word_converter()
 
 	resolved_input_path = Path(input_path).resolve()
 	if not resolved_input_path.exists():
@@ -414,22 +509,21 @@ def convert_word_document(
 
 	output_path = resolve_output_path(resolved_input_path, output_arg)
 	asset_dir = resolve_asset_dir(output_path, asset_dir_arg)
-	asset_path_prefix = resolve_asset_path_prefix(output_path, asset_dir, asset_path_arg)
+	asset_path_prefix = resolve_asset_path_prefix(output_path, asset_dir, asset_path_arg, asset_dir_arg)
 
 	temporary_directory: tempfile.TemporaryDirectory[str] | None = None
 	converted_legacy_doc = False
 	try:
 		prepared_input_path, temporary_directory, converted_legacy_doc = prepare_input_for_conversion(resolved_input_path)
 
-		converter = MarkItDown(enable_plugins=False)
-		result = converter.convert(prepared_input_path, keep_data_uris=True)
-		markdown_text = finalize_markdown(result.text_content or '')
-		localized_markdown, image_count, warnings = localize_images(
+		markdown_text, conversion_warnings = convert_docx_to_markdown(prepared_input_path)
+		localized_markdown, image_count, image_warnings = localize_images(
 			markdown_text,
 			resolved_input_path.parent,
 			asset_dir,
 			asset_path_prefix,
 		)
+		warnings = [*conversion_warnings, *image_warnings]
 
 		output_path.parent.mkdir(parents=True, exist_ok=True)
 		output_path.write_text(finalize_markdown(localized_markdown), encoding='utf-8')
@@ -480,6 +574,10 @@ class WordToMarkdownApp:
 		self.output_var = tk.StringVar(value=(getattr(initial_args, 'output', '') or ''))
 		self.asset_dir_var = tk.StringVar(value=(getattr(initial_args, 'asset_dir', '') or ''))
 		self.asset_path_var = tk.StringVar(value=(getattr(initial_args, 'asset_path', '') or ''))
+		self._asset_path_syncing = False
+		self._last_auto_asset_path = ''
+		self._asset_path_is_auto = not self.asset_path_var.get().strip()
+		self.asset_path_var.trace_add('write', self._on_asset_path_var_changed)
 		self.status_var = tk.StringVar(value='Select a Word document to start.')
 
 		self._configure_style()
@@ -560,6 +658,24 @@ class WordToMarkdownApp:
 		ttk.Entry(parent, textvariable=variable).grid(row=row, column=1, columnspan=2, sticky='ew', pady=6)
 
 
+	def _on_asset_path_var_changed(self, *_args) -> None:
+		if self._asset_path_syncing:
+			return
+
+		current_value = self.asset_path_var.get().strip()
+		self._asset_path_is_auto = current_value in {'', self._last_auto_asset_path}
+
+
+	def _set_auto_asset_path(self, value: str) -> None:
+		self._asset_path_syncing = True
+		try:
+			self.asset_path_var.set(value)
+		finally:
+			self._asset_path_syncing = False
+		self._last_auto_asset_path = value
+		self._asset_path_is_auto = True
+
+
 	def _browse_input_file(self) -> None:
 		selected = filedialog.askopenfilename(
 			title='Select Word File',
@@ -614,9 +730,12 @@ class WordToMarkdownApp:
 			self.asset_dir_var.set(str(asset_dir))
 
 		asset_path_value = self.asset_path_var.get().strip()
-		asset_path = resolve_asset_path_prefix(output_path, asset_dir, asset_path_value or None)
-		if force or not asset_path_value:
-			self.asset_path_var.set(asset_path)
+		asset_path_arg = asset_path_value or None
+		if force or not asset_path_value or self._asset_path_is_auto:
+			asset_path_arg = None
+		asset_path = resolve_asset_path_prefix(output_path, asset_dir, asset_path_arg, asset_dir_value or None)
+		if force or not asset_path_value or self._asset_path_is_auto:
+			self._set_auto_asset_path(asset_path)
 
 
 	def _start_conversion(self) -> None:
@@ -628,6 +747,7 @@ class WordToMarkdownApp:
 			messagebox.showerror('Missing Input', 'Please select a Word file first.')
 			return
 
+		self._apply_default_paths(force=False)
 		self._set_busy(True)
 		self.status_var.set('Converting...')
 		self._append_log('Starting conversion...')
