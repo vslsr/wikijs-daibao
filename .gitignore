@@ -1,0 +1,5 @@
+/.webpack-cache/
+/assets/
+/server/views/master.pug
+/server/views/legacy/master.pug
+/server/views/setup.pug
